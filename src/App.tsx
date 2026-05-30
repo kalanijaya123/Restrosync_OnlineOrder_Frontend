@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import toast, { Toaster } from 'react-hot-toast'
 import { ArrowRight, CheckCircle2, ChevronRight, Clock3, Gift, MapPin, Minus, Package, Search, ShoppingBag, Truck, UtensilsCrossed, Wallet } from 'lucide-react'
 import { getApiUrl } from './services/api'
+import { computeDiscounts, defaultDiscountSettings, fetchDiscountSettings, type DiscountSettings } from './utils/discounts'
 
 type Size = { name: string; price: number }
 type MenuItem = {
@@ -52,16 +53,45 @@ type OnlineOrder = {
     status?: string | null
     paymentStatus?: string | null
     paymentMethod?: string | null
+    cardHolderName?: string | null
+    cardLast4?: string | null
+    cardExpiry?: string | null
+    cardTransactionRef?: string | null
     orderedAt?: string | null
     expectedDeliveryAt?: string | null
     deliveredAt?: string | null
     notes?: string | null
 }
 
+type OrderHistoryItem = {
+    customerName?: string | null
+    customerPhone?: string | null
+    total?: number | null
+    paymentStatus?: string | null
+    createdAt?: string | null
+}
+
 const money = (value: number) => `Rs ${Number(value || 0).toFixed(0)}`
+
+const normalizePhone = (raw?: string | null) => {
+    if (!raw) return ''
+    return raw.replace(/\D/g, '')
+}
+
+const normalizeCustomerName = (raw?: string | null) => {
+    if (!raw) return ''
+
+    return raw
+        .trim()
+        .toLowerCase()
+        .replace(/^(mr|mrs|miss|dr)\.?\s+/i, '')
+        .replace(/\s+/g, ' ')
+}
 
 function HomePage() {
     const [menu, setMenu] = useState<MenuItem[]>([])
+    const [discountSettings, setDiscountSettings] = useState<DiscountSettings>(defaultDiscountSettings)
+    const [orderHistory, setOrderHistory] = useState<OrderHistoryItem[]>([])
     const [search, setSearch] = useState('')
     const [selectedCategory, setSelectedCategory] = useState('All')
     const [cart, setCart] = useState<CartItem[]>(() => {
@@ -80,8 +110,16 @@ function HomePage() {
         customerPhone: '',
         customerEmail: '',
         deliveryType: 'pickup',
+        paymentMethod: 'cash',
         deliveryAddress: '',
         notes: ''
+    })
+    const [showCardDetails, setShowCardDetails] = useState(false)
+    const [cardDetails, setCardDetails] = useState({
+        cardHolderName: '',
+        cardLast4: '',
+        cardExpiry: '',
+        cardTransactionRef: ''
     })
 
     useEffect(() => {
@@ -100,6 +138,27 @@ function HomePage() {
             .catch(() => setMenu([]))
     }, [])
 
+    useEffect(() => {
+        const loadSharedSettings = async () => {
+            const settings = await fetchDiscountSettings(getApiUrl)
+            setDiscountSettings(settings)
+        }
+
+        const loadOrderHistory = async () => {
+            try {
+                const response = await fetch(getApiUrl('/orders'))
+                if (!response.ok) throw new Error('Failed to load order history')
+                const data = await response.json()
+                setOrderHistory(Array.isArray(data) ? data : [])
+            } catch {
+                setOrderHistory([])
+            }
+        }
+
+        void loadSharedSettings()
+        void loadOrderHistory()
+    }, [])
+
     const categories = useMemo(() => ['All', ...Array.from(new Set(menu.map(item => item.category).filter(Boolean)))], [menu])
     const filteredMenu = useMemo(() => {
         return menu
@@ -109,8 +168,56 @@ function HomePage() {
     }, [menu, search, selectedCategory])
 
     const subtotal = cart.reduce((sum, item) => sum + item.basePrice * item.qty + item.extras.reduce((extraSum, extra) => extraSum + extra.price * extra.qty, 0) * item.qty, 0)
+    const customerIdentity = useMemo(() => {
+        const phone = normalizePhone(form.customerPhone)
+        if (phone) return `phone:${phone}`
+
+        const normalizedName = normalizeCustomerName(form.customerName)
+        if (normalizedName && normalizedName !== 'guest' && normalizedName !== 'walk-in') {
+            return `name:${normalizedName}`
+        }
+
+        return ''
+    }, [form.customerName, form.customerPhone])
+
+    const matchingOrders = useMemo(() => {
+        if (!customerIdentity) return []
+
+        return orderHistory.filter(order => {
+            const phone = normalizePhone(order.customerPhone)
+            if (customerIdentity.startsWith('phone:')) {
+                return phone && customerIdentity === `phone:${phone}`
+            }
+
+            const normalizedName = normalizeCustomerName(order.customerName)
+            return normalizedName && customerIdentity === `name:${normalizedName}`
+        })
+    }, [customerIdentity, orderHistory])
+
+    const customerOrderTotals = useMemo(
+        () => matchingOrders.map(order => Number(order.total || 0)).filter(total => Number.isFinite(total) && total > 0),
+        [matchingOrders]
+    )
+
+    const customerPaidOrderTotals = useMemo(
+        () => matchingOrders
+            .filter(order => order.paymentStatus === 'paid')
+            .map(order => Number(order.total || 0))
+            .filter(total => Number.isFinite(total) && total > 0),
+        [matchingOrders]
+    )
+
+    const discountSummary = useMemo(() => computeDiscounts({
+        subtotal,
+        orderDate: new Date().toISOString(),
+        customerOrderTotals,
+        customerPaidOrderTotals,
+        settings: discountSettings
+    }), [subtotal, customerOrderTotals, customerPaidOrderTotals, discountSettings])
+
     const deliveryFee = form.deliveryType === 'delivery' ? 350 : 0
-    const total = subtotal + deliveryFee
+    const discountedItemsTotal = discountSummary.payableAmount
+    const total = discountedItemsTotal + deliveryFee
 
     const addToCart = (item: MenuItem, size: Size) => {
         const existing = cart.find(cartItem => cartItem.menuItemId === item.id && cartItem.sizeName === size.name && cartItem.extras.length === 0)
@@ -137,6 +244,12 @@ function HomePage() {
         if (!form.customerPhone.trim()) return toast.error('Enter your phone number')
         if (form.deliveryType === 'delivery' && !form.deliveryAddress.trim()) return toast.error('Enter delivery address')
         if (cart.length === 0) return toast.error('Your cart is empty')
+        if (form.paymentMethod === 'card') {
+            if (!cardDetails.cardHolderName.trim()) return toast.error('Enter card holder name')
+            if (!cardDetails.cardLast4.trim() || cardDetails.cardLast4.trim().length < 4) return toast.error('Enter the last 4 digits of the card')
+            if (!cardDetails.cardExpiry.trim()) return toast.error('Enter card expiry')
+            if (!cardDetails.cardTransactionRef.trim()) return toast.error('Enter card transaction reference')
+        }
 
         setSubmitting(true)
         try {
@@ -159,12 +272,16 @@ function HomePage() {
                 })),
                 subtotal,
                 deliveryFee,
-                discountAmount: 0,
+                discountAmount: discountSummary.totalDiscountAmount,
                 tax: 0,
                 total,
                 status: 'pending_payment',
-                paymentStatus: 'pending',
-                paymentMethod: 'cash',
+                paymentStatus: form.paymentMethod === 'card' ? 'paid' : 'pending',
+                paymentMethod: form.paymentMethod,
+                cardHolderName: form.paymentMethod === 'card' ? cardDetails.cardHolderName.trim() : null,
+                cardLast4: form.paymentMethod === 'card' ? cardDetails.cardLast4.trim().slice(-4) : null,
+                cardExpiry: form.paymentMethod === 'card' ? cardDetails.cardExpiry.trim() : null,
+                cardTransactionRef: form.paymentMethod === 'card' ? cardDetails.cardTransactionRef.trim() : null,
                 orderedAt: new Date().toISOString(),
                 expectedDeliveryAt: null,
                 deliveredAt: null,
@@ -273,6 +390,10 @@ function HomePage() {
 
                     <div className="cart-total">
                         <div><span>Subtotal</span><strong>{money(subtotal)}</strong></div>
+                        {discountSummary.totalDiscountAmount > 0 && (
+                            <div><span>Discount</span><strong>- {money(discountSummary.totalDiscountAmount)}</strong></div>
+                        )}
+                        <div><span>After Discount</span><strong>{money(discountedItemsTotal)}</strong></div>
                         <div><span>Delivery</span><strong>{money(deliveryFee)}</strong></div>
                         <div className="grand"><span>Total</span><strong>{money(total)}</strong></div>
                         <button className="primary-btn wide" onClick={() => setShowCheckout(true)} disabled={cart.length === 0}>Checkout</button>
@@ -293,14 +414,77 @@ function HomePage() {
                                     <option value="pickup">Pickup</option>
                                     <option value="delivery">Delivery</option>
                                 </select>
+                                <select value={form.paymentMethod} onChange={e => {
+                                    const paymentMethod = e.target.value
+                                    setForm(prev => ({ ...prev, paymentMethod }))
+                                    setShowCardDetails(paymentMethod === 'card')
+                                }}>
+                                    <option value="cash">Cash</option>
+                                    <option value="card">Card</option>
+                                </select>
                                 {form.deliveryType === 'delivery' && (
                                     <input className="full" placeholder="Delivery address" value={form.deliveryAddress} onChange={e => setForm(prev => ({ ...prev, deliveryAddress: e.target.value }))} />
                                 )}
                                 <textarea className="full" rows={3} placeholder="Notes for the restaurant" value={form.notes} onChange={e => setForm(prev => ({ ...prev, notes: e.target.value }))} />
                             </div>
+                            <div className="cart-total mt-4">
+                                <div><span>Subtotal</span><strong>{money(subtotal)}</strong></div>
+                                {discountSummary.totalDiscountAmount > 0 && (
+                                    <div><span>Discount</span><strong>- {money(discountSummary.totalDiscountAmount)}</strong></div>
+                                )}
+                                <div><span>After Discount</span><strong>{money(discountedItemsTotal)}</strong></div>
+                                <div><span>Delivery</span><strong>{money(deliveryFee)}</strong></div>
+                                <div className="grand"><span>Total Payable</span><strong>{money(total)}</strong></div>
+                                {discountSummary.discounts.length > 0 && (
+                                    <div className="text-sm text-gray-400 pt-2 space-y-1">
+                                        {discountSummary.discounts.map(discount => (
+                                            <div key={discount.key} className="flex justify-between gap-4">
+                                                <span>{discount.label}</span>
+                                                <span>- {money(discount.amount)}</span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                            {form.paymentMethod === 'card' && (
+                                <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
+                                    <div className="flex items-center justify-between gap-3 mb-3">
+                                        <div>
+                                            <h3 className="text-lg font-semibold text-white">Card details</h3>
+                                            <p className="text-sm text-gray-400">Enter the details before placing the order.</p>
+                                        </div>
+                                        <button className="secondary-btn" type="button" onClick={() => setShowCardDetails(true)}>
+                                            Enter Card Details
+                                        </button>
+                                    </div>
+                                    <div className="text-sm text-gray-400">
+                                        Status will be marked as paid and the order will be sent to POS for kitchen acceptance.
+                                    </div>
+                                </div>
+                            )}
                             <div className="modal-actions">
                                 <button className="secondary-btn" onClick={() => setShowCheckout(false)}>Cancel</button>
                                 <button className="primary-btn" onClick={submitOrder} disabled={submitting}>{submitting ? 'Placing order...' : 'Place Order'}</button>
+                            </div>
+                        </motion.div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            <AnimatePresence>
+                {showCardDetails && form.paymentMethod === 'card' && (
+                    <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                        <motion.div className="modal" initial={{ y: 40, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 40, opacity: 0 }}>
+                            <h2>Card Details</h2>
+                            <div className="form-grid">
+                                <input className="full" placeholder="Card holder name" value={cardDetails.cardHolderName} onChange={e => setCardDetails(prev => ({ ...prev, cardHolderName: e.target.value }))} />
+                                <input placeholder="Last 4 digits" value={cardDetails.cardLast4} onChange={e => setCardDetails(prev => ({ ...prev, cardLast4: e.target.value.replace(/\D/g, '').slice(0, 4) }))} />
+                                <input placeholder="Expiry (MM/YY)" value={cardDetails.cardExpiry} onChange={e => setCardDetails(prev => ({ ...prev, cardExpiry: e.target.value }))} />
+                                <input className="full" placeholder="Transaction reference" value={cardDetails.cardTransactionRef} onChange={e => setCardDetails(prev => ({ ...prev, cardTransactionRef: e.target.value }))} />
+                            </div>
+                            <div className="modal-actions">
+                                <button className="secondary-btn" onClick={() => setShowCardDetails(false)}>Cancel</button>
+                                <button className="primary-btn" onClick={() => setShowCardDetails(false)}>Okay</button>
                             </div>
                         </motion.div>
                     </motion.div>
@@ -315,6 +499,10 @@ function TrackPage() {
     const [token, setToken] = useState(params.token || '')
     const [order, setOrder] = useState<OnlineOrder | null>(null)
     const [loading, setLoading] = useState(false)
+    const [polling, setPolling] = useState(false)
+    const [historyOpen, setHistoryOpen] = useState(false)
+    const [historyList, setHistoryList] = useState<OnlineOrder[]>([])
+    const [historyLoading, setHistoryLoading] = useState(false)
 
     const lookup = async (value = token) => {
         if (!value.trim()) return toast.error('Enter tracking token')
@@ -331,6 +519,21 @@ function TrackPage() {
         }
     }
 
+    // Poll for updates when an order is loaded
+    useEffect(() => {
+        let id: any
+        if (order) {
+            setPolling(true)
+            id = setInterval(() => lookup(order.trackingToken || token), 8000)
+        } else {
+            setPolling(false)
+        }
+
+        return () => {
+            if (id) clearInterval(id)
+        }
+    }, [order])
+
     useEffect(() => {
         if (params.token) void lookup(params.token)
     }, [params.token])
@@ -338,6 +541,9 @@ function TrackPage() {
     return (
         <div className="page-shell narrow">
             <Toaster position="top-center" />
+            <div className="track-back-row">
+                <Link to="/" className="secondary-btn">← Back to Home</Link>
+            </div>
             <header className="track-hero">
                 <h1>Track Your Order</h1>
                 <p>Enter the tracking token from your receipt.</p>
@@ -355,16 +561,88 @@ function TrackPage() {
                             <p className="eyebrow">{order.orderNumber || 'Online Order'}</p>
                             <h2>{order.customerName || 'Guest'}</h2>
                         </div>
-                        <span>{order.status || 'pending_payment'}</span>
+                        <div className="flex items-center gap-3">
+                            <span className="status-pill">{order.status || 'pending_payment'}</span>
+                            <button className="secondary-btn" onClick={() => lookup(order.trackingToken || '')}>Refresh</button>
+                            <button className="secondary-btn" onClick={() => { setHistoryOpen(true); }}>Order History</button>
+                        </div>
                     </div>
                     <div className="track-meta">
                         <div><MapPin size={16} /> {order.deliveryType || 'pickup'}</div>
                         <div><Wallet size={16} /> {order.paymentStatus || 'pending'}</div>
                         <div><Clock3 size={16} /> {order.orderedAt ? new Date(order.orderedAt).toLocaleString() : 'Just now'}</div>
                     </div>
+                    {/* Items */}
+                    <div className="track-items mt-4">
+                        <h3 className="text-sm text-gray-300">Items</h3>
+                        <div className="space-y-2 mt-2">
+                            {(order.items || []).map((it, idx) => (
+                                <div key={idx} className="flex justify-between bg-white/5 p-3 rounded-lg">
+                                    <div>
+                                        <div className="font-semibold">{it.menuItemName}</div>
+                                        <div className="text-sm text-gray-400">{it.sizeName} • Qty: {it.qty}</div>
+                                    </div>
+                                    <div className="text-green-300 font-semibold">Rs {Number(it.basePrice || 0) * (it.qty || 1)}</div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* Timeline */}
+                    <div className="track-timeline mt-6">
+                        <h3 className="text-sm text-gray-300">Timeline</h3>
+                        <ul className="mt-2 text-sm text-gray-400 space-y-2">
+                            <li><strong>Ordered:</strong> {order.orderedAt ? new Date(order.orderedAt).toLocaleString() : '—'}</li>
+                            <li><strong>Expected:</strong> {order.expectedDeliveryAt ? new Date(order.expectedDeliveryAt).toLocaleString() : '—'}</li>
+                            <li><strong>Delivered:</strong> {order.deliveredAt ? new Date(order.deliveredAt).toLocaleString() : '—'}</li>
+                            <li><strong>Payment Method:</strong> {order.paymentMethod || '—'}</li>
+                            <li><strong>Payment Status:</strong> {order.paymentStatus || '—'}</li>
+                        </ul>
+                    </div>
                     <div className="track-summary">
                         <strong>Total</strong>
                         <span>{money(order.total || 0)}</span>
+                    </div>
+                </div>
+            )}
+
+            {/* History Modal */}
+            {historyOpen && (
+                <div className="modal-backdrop">
+                    <div className="modal">
+                        <h2>Order History</h2>
+                        <p className="text-sm text-gray-400">Showing previous orders for this phone number.</p>
+                        <div className="mt-4">
+                            <button className="secondary-btn" onClick={async () => {
+                                setHistoryLoading(true)
+                                try {
+                                    const res = await fetch(getApiUrl('/online-orders'))
+                                    const data = await res.json()
+                                    const list = Array.isArray(data) ? data : []
+                                    const filtered = list.filter((o: any) => (o.customerPhone || '') === (order?.customerPhone || ''))
+                                    setHistoryList(filtered)
+                                } catch (err) {
+                                    setHistoryList([])
+                                } finally {
+                                    setHistoryLoading(false)
+                                }
+                            }}>Load History</button>
+                        </div>
+
+                        <div className="mt-4 space-y-3">
+                            {historyLoading && <div className="text-gray-400">Loading...</div>}
+                            {!historyLoading && historyList.length === 0 && <div className="text-gray-400">No history found</div>}
+                            {!historyLoading && historyList.map(h => (
+                                <div key={h.id} className="bg-white/5 p-3 rounded-lg">
+                                    <div className="flex justify-between"><div className="font-semibold">{h.orderNumber}</div><div className="text-sm text-gray-400">{h.status}</div></div>
+                                    <div className="text-sm text-gray-400">{h.orderedAt ? new Date(h.orderedAt).toLocaleString() : ''} • Rs {h.total}</div>
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="modal-actions mt-6">
+                            <button className="secondary-btn" onClick={() => setHistoryOpen(false)}>Close</button>
+                        </div>
                     </div>
                 </div>
             )}
