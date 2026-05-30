@@ -16,6 +16,7 @@ type MenuItem = {
     available?: boolean
     recipe?: Array<{ ingredientId: string; ingredientName: string; quantities: Record<string, number> }>
     extras?: Array<{ id: string; name: string; price: number; quantityPerUnit: number; ingredientId: string }>
+    mealPeriods?: string[]
 }
 
 type CartExtra = { extraId: string; name: string; price: number; qty: number }
@@ -73,6 +74,27 @@ type OrderHistoryItem = {
 
 const money = (value: number) => `Rs ${Number(value || 0).toFixed(0)}`
 
+const SERVICE_PERIODS = ['Breakfast', 'Lunch', 'Dinner'] as const
+const MEAL_PERIODS = ['All Day', ...SERVICE_PERIODS] as const
+
+const normalizeMealPeriods = (mealPeriods?: string[] | null) => {
+    const cleaned = Array.from(new Set((mealPeriods || [])
+        .map(period => period.trim())
+        .filter(Boolean)
+        .filter(period => period === 'All Day' || SERVICE_PERIODS.includes(period as any))))
+
+    if (cleaned.length === 0 || cleaned.includes('All Day') || cleaned.length === SERVICE_PERIODS.length) {
+        return [...SERVICE_PERIODS]
+    }
+
+    return SERVICE_PERIODS.filter(period => cleaned.includes(period))
+}
+
+const matchesMealPeriod = (mealPeriods: string[] | undefined, selectedPeriod: typeof MEAL_PERIODS[number]) => {
+    if (selectedPeriod === 'All Day') return true
+    return normalizeMealPeriods(mealPeriods).includes(selectedPeriod)
+}
+
 const normalizePhone = (raw?: string | null) => {
     if (!raw) return ''
     return raw.replace(/\D/g, '')
@@ -93,6 +115,7 @@ function HomePage() {
     const [discountSettings, setDiscountSettings] = useState<DiscountSettings>(defaultDiscountSettings)
     const [orderHistory, setOrderHistory] = useState<OrderHistoryItem[]>([])
     const [search, setSearch] = useState('')
+    const [selectedMealPeriod, setSelectedMealPeriod] = useState<typeof MEAL_PERIODS[number]>('All Day')
     const [selectedCategory, setSelectedCategory] = useState('All')
     const [cart, setCart] = useState<CartItem[]>(() => {
         try {
@@ -133,7 +156,8 @@ function HomePage() {
                 ...item,
                 sizes: Array.isArray(item.sizes) ? item.sizes : [],
                 extras: Array.isArray(item.extras) ? item.extras : [],
-                recipe: Array.isArray(item.recipe) ? item.recipe : []
+                recipe: Array.isArray(item.recipe) ? item.recipe : [],
+                mealPeriods: Array.isArray(item.mealPeriods) ? item.mealPeriods : []
             })) : []))
             .catch(() => setMenu([]))
     }, [])
@@ -159,13 +183,20 @@ function HomePage() {
         void loadOrderHistory()
     }, [])
 
-    const categories = useMemo(() => ['All', ...Array.from(new Set(menu.map(item => item.category).filter(Boolean)))], [menu])
+    const categories = useMemo(() => ['All', ...Array.from(new Set(menu
+        .filter(item => matchesMealPeriod(item.mealPeriods, selectedMealPeriod))
+        .map(item => item.category).filter(Boolean)))], [menu, selectedMealPeriod])
     const filteredMenu = useMemo(() => {
         return menu
+            .filter(item => matchesMealPeriod(item.mealPeriods, selectedMealPeriod))
             .filter(item => selectedCategory === 'All' || item.category === selectedCategory)
             .filter(item => item.name.toLowerCase().includes(search.toLowerCase()))
             .filter(item => item.available !== false)
-    }, [menu, search, selectedCategory])
+    }, [menu, search, selectedCategory, selectedMealPeriod])
+
+    useEffect(() => {
+        setSelectedCategory('All')
+    }, [selectedMealPeriod])
 
     const subtotal = cart.reduce((sum, item) => sum + item.basePrice * item.qty + item.extras.reduce((extraSum, extra) => extraSum + extra.price * extra.qty, 0) * item.qty, 0)
     const customerIdentity = useMemo(() => {
@@ -334,6 +365,11 @@ function HomePage() {
                     <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search dishes" />
                 </div>
                 <div className="chips">
+                    {MEAL_PERIODS.map(period => (
+                        <button key={period} className={selectedMealPeriod === period ? 'chip active' : 'chip'} onClick={() => setSelectedMealPeriod(period)}>{period}</button>
+                    ))}
+                </div>
+                <div className="chips">
                     {categories.map(category => (
                         <button key={category} className={selectedCategory === category ? 'chip active' : 'chip'} onClick={() => setSelectedCategory(category)}>{category}</button>
                     ))}
@@ -349,6 +385,9 @@ function HomePage() {
                                 <div className="menu-title-row">
                                     <h3>{item.name}</h3>
                                     <span>{item.category}</span>
+                                </div>
+                                <div className="menu-tag-row">
+                                    <span>{normalizeMealPeriods(item.mealPeriods).length === SERVICE_PERIODS.length ? 'All Day' : normalizeMealPeriods(item.mealPeriods).join(', ')}</span>
                                 </div>
                                 <div className="size-list">
                                     {item.sizes.map(size => (
