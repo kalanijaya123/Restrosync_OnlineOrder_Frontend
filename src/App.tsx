@@ -5,6 +5,9 @@ import toast, { Toaster } from 'react-hot-toast'
 import { ArrowRight, CheckCircle2, ChevronRight, Clock3, Gift, MapPin, Minus, Package, Search, ShoppingBag, Truck, UtensilsCrossed, Wallet } from 'lucide-react'
 import { getApiUrl } from './services/api'
 import { computeDiscounts, defaultDiscountSettings, fetchDiscountSettings, type DiscountSettings } from './utils/discounts'
+import LocationPickerMap from './components/LocationPickerMap'
+import LoginPage from './pages/Login'
+import RegisterPage from './pages/Register'
 
 type Size = { name: string; price: number }
 type MenuItem = {
@@ -19,6 +22,7 @@ type MenuItem = {
     mealPeriods?: string[]
 }
 
+const statusClassName = (s?: string | null) => `status-${(s || 'pending_payment').replace(/_/g, '-')}`
 type CartExtra = { extraId: string; name: string; price: number; qty: number }
 type CartItem = {
     menuItemId: string
@@ -37,6 +41,9 @@ type OnlineOrder = {
     customerPhone?: string | null
     customerEmail?: string | null
     deliveryAddress?: string | null
+    deliveryLatitude?: number | null
+    deliveryLongitude?: number | null
+    deliveryDistanceKm?: number | null
     deliveryType?: string | null
     items?: Array<{
         menuItemId: string
@@ -64,18 +71,45 @@ type OnlineOrder = {
     notes?: string | null
 }
 
+type DeliverySettings = {
+    restaurantLatitude: number
+    restaurantLongitude: number
+}
+
 type OrderHistoryItem = {
+    id?: string | null
+    orderNo?: number | null
+    status?: string | null
     customerName?: string | null
     customerPhone?: string | null
     total?: number | null
     paymentStatus?: string | null
     createdAt?: string | null
+    updatedAt?: string | null
+    servedAt?: string | null
+    notes?: string | null
 }
 
 const money = (value: number) => `Rs ${Number(value || 0).toFixed(0)}`
 
 const SERVICE_PERIODS = ['Breakfast', 'Lunch', 'Dinner'] as const
 const MEAL_PERIODS = ['All Day', ...SERVICE_PERIODS] as const
+
+const statusLabel: Record<string, string> = {
+    pending_payment: 'Awaiting Payment',
+    payment_pending: 'Payment Pending',
+    paid_awaiting_kitchen: 'Paid - Awaiting Kitchen',
+    pending: 'Pending',
+    confirmed: 'Confirmed',
+    preparing: 'Preparing',
+    ready: 'Ready',
+    served: 'Served',
+    out_for_delivery: 'Out for Delivery',
+    delivered: 'Delivered',
+    cancelled: 'Cancelled'
+}
+
+const historyStatusFlow = ['payment_pending', 'paid_awaiting_kitchen', 'pending', 'preparing', 'ready', 'served', 'cancelled'] as const
 
 const normalizeMealPeriods = (mealPeriods?: string[] | null) => {
     const cleaned = Array.from(new Set((mealPeriods || [])
@@ -110,10 +144,29 @@ const normalizeCustomerName = (raw?: string | null) => {
         .replace(/\s+/g, ' ')
 }
 
+const getCurrentUser = () => {
+    try {
+        return JSON.parse(localStorage.getItem('currentUser') || 'null')
+    } catch {
+        return null
+    }
+}
+
+const hasOnlineOrderAccess = () => {
+    const user = getCurrentUser()
+    return Boolean(user)
+}
+
+const OnlineOrderGuard = ({ children }: { children: React.ReactNode }) => {
+    return hasOnlineOrderAccess() ? <>{children}</> : <Navigate to="/login" replace />
+}
+
 function HomePage() {
     const [menu, setMenu] = useState<MenuItem[]>([])
     const [discountSettings, setDiscountSettings] = useState<DiscountSettings>(defaultDiscountSettings)
     const [orderHistory, setOrderHistory] = useState<OrderHistoryItem[]>([])
+    const [historyOpen, setHistoryOpen] = useState(false)
+    const [selectedHistoryOrder, setSelectedHistoryOrder] = useState<OrderHistoryItem | null>(null)
     const [search, setSearch] = useState('')
     const [selectedMealPeriod, setSelectedMealPeriod] = useState<typeof MEAL_PERIODS[number]>('All Day')
     const [selectedCategory, setSelectedCategory] = useState('All')
@@ -126,6 +179,13 @@ function HomePage() {
     })
     const [showCheckout, setShowCheckout] = useState(false)
     const [submitting, setSubmitting] = useState(false)
+    const [deliverySettings, setDeliverySettings] = useState<DeliverySettings>({
+        restaurantLatitude: 6.9271,
+        restaurantLongitude: 79.8612
+    })
+    const [deliveryFee, setDeliveryFee] = useState(0)
+    const [deliveryDistanceKm, setDeliveryDistanceKm] = useState<number | null>(null)
+    const [calculationLoading, setCalculationLoading] = useState(false)
     const navigate = useNavigate()
 
     const [form, setForm] = useState({
@@ -135,6 +195,8 @@ function HomePage() {
         deliveryType: 'pickup',
         paymentMethod: 'cash',
         deliveryAddress: '',
+        deliveryLatitude: null as number | null,
+        deliveryLongitude: null as number | null,
         notes: ''
     })
     const [showCardDetails, setShowCardDetails] = useState(false)
@@ -168,6 +230,21 @@ function HomePage() {
             setDiscountSettings(settings)
         }
 
+        const loadDeliverySettings = async () => {
+            try {
+                const response = await fetch(getApiUrl('/delivery-settings'))
+                if (!response.ok) throw new Error('Failed to load delivery settings')
+                const data = await response.json()
+
+                setDeliverySettings({
+                    restaurantLatitude: Number(data?.restaurantLatitude) || 6.9271,
+                    restaurantLongitude: Number(data?.restaurantLongitude) || 79.8612
+                })
+            } catch {
+                setDeliverySettings({ restaurantLatitude: 6.9271, restaurantLongitude: 79.8612 })
+            }
+        }
+
         const loadOrderHistory = async () => {
             try {
                 const response = await fetch(getApiUrl('/orders'))
@@ -180,8 +257,53 @@ function HomePage() {
         }
 
         void loadSharedSettings()
+        void loadDeliverySettings()
         void loadOrderHistory()
     }, [])
+
+    useEffect(() => {
+        const calculateDelivery = async () => {
+            if (
+                form.deliveryType !== 'delivery'
+                || form.deliveryLatitude == null
+                || form.deliveryLongitude == null
+            ) {
+                setDeliveryFee(0)
+                setDeliveryDistanceKm(null)
+                return
+            }
+
+            setCalculationLoading(true)
+            try {
+                const response = await fetch(getApiUrl('/delivery-settings/calculate'), {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        customerLatitude: form.deliveryLatitude,
+                        customerLongitude: form.deliveryLongitude
+                    })
+                })
+
+                if (!response.ok) throw new Error('Failed to calculate delivery fee')
+                const data = await response.json()
+                setDeliveryDistanceKm(Number(data?.distanceKm) || 0)
+
+                const fee = Number(data?.deliveryFee)
+                if (Number.isFinite(fee)) {
+                    setDeliveryFee(fee)
+                } else {
+                    setDeliveryFee(0)
+                }
+            } catch {
+                setDeliveryFee(0)
+                setDeliveryDistanceKm(null)
+            } finally {
+                setCalculationLoading(false)
+            }
+        }
+
+        void calculateDelivery()
+    }, [form.deliveryType, form.deliveryLatitude, form.deliveryLongitude])
 
     const categories = useMemo(() => ['All', ...Array.from(new Set(menu
         .filter(item => matchesMealPeriod(item.mealPeriods, selectedMealPeriod))
@@ -191,7 +313,6 @@ function HomePage() {
             .filter(item => matchesMealPeriod(item.mealPeriods, selectedMealPeriod))
             .filter(item => selectedCategory === 'All' || item.category === selectedCategory)
             .filter(item => item.name.toLowerCase().includes(search.toLowerCase()))
-            .filter(item => item.available !== false)
     }, [menu, search, selectedCategory, selectedMealPeriod])
 
     useEffect(() => {
@@ -246,9 +367,15 @@ function HomePage() {
         settings: discountSettings
     }), [subtotal, customerOrderTotals, customerPaidOrderTotals, discountSettings])
 
-    const deliveryFee = form.deliveryType === 'delivery' ? 350 : 0
+    const effectiveDeliveryFee = form.deliveryType === 'delivery' ? deliveryFee : 0
     const discountedItemsTotal = discountSummary.payableAmount
-    const total = discountedItemsTotal + deliveryFee
+    const total = discountedItemsTotal + effectiveDeliveryFee
+
+    const openOrderHistory = () => {
+        const initialSelection = orderHistory[0] || null
+        setSelectedHistoryOrder(initialSelection)
+        setHistoryOpen(true)
+    }
 
     const addToCart = (item: MenuItem, size: Size) => {
         const existing = cart.find(cartItem => cartItem.menuItemId === item.id && cartItem.sizeName === size.name && cartItem.extras.length === 0)
@@ -270,10 +397,39 @@ function HomePage() {
         })
     }
 
+    const updateDeliveryAddressFromCoords = (lat: number, lng: number) => {
+        setForm(prev => ({
+            ...prev,
+            deliveryAddress: `Selected location: ${lat.toFixed(6)}, ${lng.toFixed(6)}`,
+            deliveryLatitude: Number(lat.toFixed(6)),
+            deliveryLongitude: Number(lng.toFixed(6))
+        }))
+    }
+
+    const useCurrentLocation = () => {
+        if (!navigator.geolocation) {
+            toast.error('Geolocation is not supported on this device')
+            return
+        }
+
+        navigator.geolocation.getCurrentPosition(
+            (position) => {
+                updateDeliveryAddressFromCoords(position.coords.latitude, position.coords.longitude)
+            },
+            () => {
+                toast.error('Unable to access your location')
+            },
+            { enableHighAccuracy: true }
+        )
+    }
+
     const submitOrder = async () => {
         if (!form.customerName.trim()) return toast.error('Enter your name')
         if (!form.customerPhone.trim()) return toast.error('Enter your phone number')
         if (form.deliveryType === 'delivery' && !form.deliveryAddress.trim()) return toast.error('Enter delivery address')
+        if (form.deliveryType === 'delivery' && (form.deliveryLatitude == null || form.deliveryLongitude == null)) {
+            return toast.error('Pick your delivery location on the map')
+        }
         if (cart.length === 0) return toast.error('Your cart is empty')
         if (form.paymentMethod === 'card') {
             if (!cardDetails.cardHolderName.trim()) return toast.error('Enter card holder name')
@@ -292,6 +448,9 @@ function HomePage() {
                 customerPhone: form.customerPhone.trim(),
                 customerEmail: form.customerEmail.trim() || null,
                 deliveryAddress: form.deliveryType === 'delivery' ? form.deliveryAddress.trim() : null,
+                deliveryLatitude: form.deliveryType === 'delivery' ? form.deliveryLatitude : null,
+                deliveryLongitude: form.deliveryType === 'delivery' ? form.deliveryLongitude : null,
+                deliveryDistanceKm: form.deliveryType === 'delivery' ? deliveryDistanceKm : null,
                 deliveryType: form.deliveryType,
                 items: cart.map(item => ({
                     menuItemId: item.menuItemId,
@@ -302,11 +461,9 @@ function HomePage() {
                     extras: item.extras.map(extra => ({ extraId: extra.extraId, qty: extra.qty }))
                 })),
                 subtotal,
-                deliveryFee,
+                deliveryFee: effectiveDeliveryFee,
                 discountAmount: discountSummary.totalDiscountAmount,
                 tax: 0,
-                total,
-                status: 'pending_payment',
                 paymentStatus: form.paymentMethod === 'card' ? 'paid' : 'pending',
                 paymentMethod: form.paymentMethod,
                 cardHolderName: form.paymentMethod === 'card' ? cardDetails.cardHolderName.trim() : null,
@@ -349,6 +506,7 @@ function HomePage() {
                     <p className="hero-copy">Browse the menu, customize your cart, and send the order straight to the restaurant system.</p>
                     <div className="hero-actions">
                         <Link to="/track" className="secondary-btn">Track Order</Link>
+                        <button type="button" className="secondary-btn" onClick={openOrderHistory}>Order History</button>
                         <a href="#menu" className="primary-btn">Start Ordering <ArrowRight size={18} /></a>
                     </div>
                 </div>
@@ -379,19 +537,24 @@ function HomePage() {
             <main className="content-grid" id="menu">
                 <section className="menu-grid">
                     {filteredMenu.map(item => (
-                        <article key={item.id} className="menu-card">
+                        <article key={item.id} className={item.available === false ? 'menu-card menu-card-unavailable' : 'menu-card'}>
                             {item.mediaUrl ? <img src={item.mediaUrl} alt={item.name} /> : <div className="placeholder"><UtensilsCrossed size={40} /></div>}
                             <div className="menu-card-body">
                                 <div className="menu-title-row">
                                     <h3>{item.name}</h3>
                                     <span>{item.category}</span>
                                 </div>
+                                {item.available === false && (
+                                    <div className="menu-unavailable-badge">
+                                        Not available
+                                    </div>
+                                )}
                                 <div className="menu-tag-row">
                                     <span>{normalizeMealPeriods(item.mealPeriods).length === SERVICE_PERIODS.length ? 'All Day' : normalizeMealPeriods(item.mealPeriods).join(', ')}</span>
                                 </div>
                                 <div className="size-list">
                                     {item.sizes.map(size => (
-                                        <button key={size.name} className="size-btn" onClick={() => addToCart(item, size)}>
+                                        <button key={size.name} className={item.available === false ? 'size-btn size-btn-disabled' : 'size-btn'} onClick={() => item.available === false ? toast.error(`${item.name} is not available`) : addToCart(item, size)} disabled={item.available === false}>
                                             <span>{size.name}</span>
                                             <strong>{money(size.price)}</strong>
                                         </button>
@@ -433,7 +596,7 @@ function HomePage() {
                             <div><span>Discount</span><strong>- {money(discountSummary.totalDiscountAmount)}</strong></div>
                         )}
                         <div><span>After Discount</span><strong>{money(discountedItemsTotal)}</strong></div>
-                        <div><span>Delivery</span><strong>{money(deliveryFee)}</strong></div>
+                        <div><span>Delivery</span><strong>{money(effectiveDeliveryFee)}</strong></div>
                         <div className="grand"><span>Total</span><strong>{money(total)}</strong></div>
                         <button className="primary-btn wide" onClick={() => setShowCheckout(true)} disabled={cart.length === 0}>Checkout</button>
                     </div>
@@ -441,15 +604,113 @@ function HomePage() {
             </main>
 
             <AnimatePresence>
+                {historyOpen && (
+                    <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                        <motion.div className="modal checkout-modal order-history-modal" initial={{ y: 30, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 30, opacity: 0 }}>
+                            <div className="order-history-header">
+                                <div>
+                                    <h2>Order History</h2>
+                                    <p>Tap any order to review its current status flow.</p>
+                                </div>
+                                <button className="secondary-btn" onClick={() => setHistoryOpen(false)}>Close</button>
+                            </div>
+
+                            <div className="order-history-grid">
+                                <div className="order-history-list">
+                                    {orderHistory.length === 0 ? (
+                                        <div className="order-history-empty">No orders found yet.</div>
+                                    ) : orderHistory.map((item, index) => {
+                                        const isSelected = selectedHistoryOrder?.id && item.id ? selectedHistoryOrder.id === item.id : selectedHistoryOrder === item
+                                        return (
+                                            <button
+                                                key={item.id || `${item.orderNo || 'order'}-${index}`}
+                                                className={isSelected ? 'order-history-item active' : 'order-history-item'}
+                                                onClick={() => setSelectedHistoryOrder(item)}
+                                                type="button"
+                                            >
+                                                <div className="order-history-item-top">
+                                                    <strong>Order #{item.orderNo || index + 1}</strong>
+                                                    <span>{statusLabel[item.status || ''] || item.status || 'pending'}</span>
+                                                </div>
+                                                <div className="order-history-item-meta">{item.createdAt ? new Date(item.createdAt).toLocaleString() : 'No date available'}</div>
+                                                <div className="order-history-item-meta">{item.customerName || 'Guest'} • {item.paymentStatus || 'payment unknown'}</div>
+                                            </button>
+                                        )
+                                    })}
+                                </div>
+
+                                <div className="order-history-detail">
+                                    {selectedHistoryOrder ? (
+                                        <>
+                                            <div className="order-history-detail-head">
+                                                <div>
+                                                    <p className="order-history-eyebrow">Selected order</p>
+                                                    <h3>Order #{selectedHistoryOrder.orderNo || '—'}</h3>
+                                                </div>
+                                                <span className={`track-status-banner ${statusClassName(selectedHistoryOrder.status || 'pending')}`}>
+                                                    {statusLabel[selectedHistoryOrder.status || ''] || selectedHistoryOrder.status || 'pending'}
+                                                </span>
+                                            </div>
+
+                                            <div className="order-history-status-grid">
+                                                {historyStatusFlow.map((step, index) => {
+                                                    const activeIndex = Math.max(0, historyStatusFlow.indexOf((selectedHistoryOrder.status || 'payment_pending') as any))
+                                                    const active = index <= activeIndex
+                                                    return (
+                                                        <div key={step} className={active ? 'order-history-step active' : 'order-history-step'}>
+                                                            <div className="order-history-step-line">
+                                                                <div className={active ? 'order-history-step-dot active' : 'order-history-step-dot'} />
+                                                            </div>
+                                                            <div className="order-history-step-label">{statusLabel[step] || step.replace(/_/g, ' ')}</div>
+                                                        </div>
+                                                    )
+                                                })}
+                                            </div>
+
+                                            <div className="order-history-detail-grid">
+                                                <div><span>Customer</span><strong>{selectedHistoryOrder.customerName || 'Guest'}</strong></div>
+                                                <div><span>Phone</span><strong>{selectedHistoryOrder.customerPhone || '—'}</strong></div>
+                                                <div><span>Payment</span><strong>{selectedHistoryOrder.paymentStatus || '—'}</strong></div>
+                                                <div><span>Total</span><strong>{money(selectedHistoryOrder.total || 0)}</strong></div>
+                                                <div><span>Ordered</span><strong>{selectedHistoryOrder.createdAt ? new Date(selectedHistoryOrder.createdAt).toLocaleString() : '—'}</strong></div>
+                                                <div><span>Updated</span><strong>{selectedHistoryOrder.updatedAt ? new Date(selectedHistoryOrder.updatedAt).toLocaleString() : '—'}</strong></div>
+                                            </div>
+
+                                            {selectedHistoryOrder.notes && (
+                                                <div className="order-history-notes">
+                                                    <span>Notes</span>
+                                                    <p>{selectedHistoryOrder.notes}</p>
+                                                </div>
+                                            )}
+                                        </>
+                                    ) : (
+                                        <div className="order-history-empty">Select an order to see its status flow.</div>
+                                    )}
+                                </div>
+                            </div>
+                        </motion.div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            <AnimatePresence>
                 {showCheckout && (
                     <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                        <motion.div className="modal" initial={{ y: 40, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 40, opacity: 0 }}>
+                        <motion.div className="modal checkout-modal" initial={{ y: 40, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 40, opacity: 0 }}>
                             <h2>Checkout</h2>
                             <div className="form-grid">
                                 <input placeholder="Full name" value={form.customerName} onChange={e => setForm(prev => ({ ...prev, customerName: e.target.value }))} />
                                 <input placeholder="Phone number" value={form.customerPhone} onChange={e => setForm(prev => ({ ...prev, customerPhone: e.target.value }))} />
                                 <input placeholder="Email (optional)" value={form.customerEmail} onChange={e => setForm(prev => ({ ...prev, customerEmail: e.target.value }))} />
-                                <select value={form.deliveryType} onChange={e => setForm(prev => ({ ...prev, deliveryType: e.target.value }))}>
+                                <select value={form.deliveryType} onChange={e => {
+                                    const nextType = e.target.value
+                                    setForm(prev => ({
+                                        ...prev,
+                                        deliveryType: nextType,
+                                        deliveryLatitude: nextType === 'delivery' ? prev.deliveryLatitude : null,
+                                        deliveryLongitude: nextType === 'delivery' ? prev.deliveryLongitude : null
+                                    }))
+                                }}>
                                     <option value="pickup">Pickup</option>
                                     <option value="delivery">Delivery</option>
                                 </select>
@@ -462,7 +723,50 @@ function HomePage() {
                                     <option value="card">Card</option>
                                 </select>
                                 {form.deliveryType === 'delivery' && (
-                                    <input className="full" placeholder="Delivery address" value={form.deliveryAddress} onChange={e => setForm(prev => ({ ...prev, deliveryAddress: e.target.value }))} />
+                                    <>
+                                        <input className="full" placeholder="Delivery address" value={form.deliveryAddress} onChange={e => setForm(prev => ({ ...prev, deliveryAddress: e.target.value }))} />
+                                        <div className="full mt-2 rounded-xl border border-white/10 bg-white/5 p-3">
+                                            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                                                <p className="text-sm text-gray-300">Pick delivery location from the map</p>
+                                                <button type="button" className="secondary-btn" onClick={useCurrentLocation}>Use My Current Location</button>
+                                            </div>
+                                            <LocationPickerMap
+                                                center={{
+                                                    lat: deliverySettings.restaurantLatitude,
+                                                    lng: deliverySettings.restaurantLongitude
+                                                }}
+                                                restaurantLocation={{
+                                                    lat: deliverySettings.restaurantLatitude,
+                                                    lng: deliverySettings.restaurantLongitude
+                                                }}
+                                                customerLocation={
+                                                    form.deliveryLatitude != null && form.deliveryLongitude != null
+                                                        ? { lat: form.deliveryLatitude, lng: form.deliveryLongitude }
+                                                        : null
+                                                }
+                                                onSelect={(coords) => setForm(prev => ({
+                                                    ...prev,
+                                                    deliveryLatitude: Number(coords.lat.toFixed(6)),
+                                                    deliveryLongitude: Number(coords.lng.toFixed(6))
+                                                }))}
+                                                height={240}
+                                            />
+                                            <div className="mt-3 text-sm text-gray-300">
+                                                {form.deliveryLatitude != null && form.deliveryLongitude != null ? (
+                                                    <>
+                                                        <div>Selected: {form.deliveryLatitude.toFixed(6)}, {form.deliveryLongitude.toFixed(6)}</div>
+                                                        <div>
+                                                            {calculationLoading
+                                                                ? 'Calculating delivery fee...'
+                                                                : `Distance: ${deliveryDistanceKm != null ? deliveryDistanceKm.toFixed(2) : '0.00'} km`}
+                                                        </div>
+                                                    </>
+                                                ) : (
+                                                    <div>Tap on map to set your delivery pin.</div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </>
                                 )}
                                 <textarea className="full" rows={3} placeholder="Notes for the restaurant" value={form.notes} onChange={e => setForm(prev => ({ ...prev, notes: e.target.value }))} />
                             </div>
@@ -472,7 +776,7 @@ function HomePage() {
                                     <div><span>Discount</span><strong>- {money(discountSummary.totalDiscountAmount)}</strong></div>
                                 )}
                                 <div><span>After Discount</span><strong>{money(discountedItemsTotal)}</strong></div>
-                                <div><span>Delivery</span><strong>{money(deliveryFee)}</strong></div>
+                                <div><span>Delivery</span><strong>{money(effectiveDeliveryFee)}</strong></div>
                                 <div className="grand"><span>Total Payable</span><strong>{money(total)}</strong></div>
                                 {discountSummary.discounts.length > 0 && (
                                     <div className="text-sm text-gray-400 pt-2 space-y-1">
@@ -542,6 +846,8 @@ function TrackPage() {
     const [historyOpen, setHistoryOpen] = useState(false)
     const [historyList, setHistoryList] = useState<OnlineOrder[]>([])
     const [historyLoading, setHistoryLoading] = useState(false)
+    const statusFlow = ['pending_payment', 'confirmed', 'preparing', 'ready', 'out_for_delivery', 'delivered']
+    const progressIndex = Math.max(0, statusFlow.indexOf(order?.status || 'pending_payment'))
 
     const lookup = async (value = token) => {
         if (!value.trim()) return toast.error('Enter tracking token')
@@ -578,67 +884,132 @@ function TrackPage() {
     }, [params.token])
 
     return (
-        <div className="page-shell narrow">
+        <div className="page-shell narrow track-page-shell">
             <Toaster position="top-center" />
             <div className="track-back-row">
                 <Link to="/" className="secondary-btn">← Back to Home</Link>
             </div>
-            <header className="track-hero">
+            <header className="track-hero track-hero-pastel">
                 <h1>Track Your Order</h1>
                 <p>Enter the tracking token from your receipt.</p>
             </header>
 
-            <div className="track-box">
+            <div className="track-box track-box-pastel">
                 <input value={token} onChange={e => setToken(e.target.value)} placeholder="Tracking token" />
                 <button className="primary-btn" onClick={() => lookup()} disabled={loading}>{loading ? 'Searching...' : 'Track Order'}</button>
             </div>
 
             {order && (
-                <div className="track-result">
-                    <div className="track-result-head">
-                        <div>
-                            <p className="eyebrow">{order.orderNumber || 'Online Order'}</p>
-                            <h2>{order.customerName || 'Guest'}</h2>
+                <div className="track-result track-result-pastel track-card">
+                    <div className="track-head">
+                        <div className={`track-status-banner ${statusClassName(order.status)}`}>
+                            <div className="track-status-inner">
+                                <CheckCircle2 size={18} />
+                                <span className="track-status-text">{statusLabel[order.status || ''] || order.status || 'pending_payment'}</span>
+                            </div>
                         </div>
-                        <div className="flex items-center gap-3">
-                            <span className="status-pill">{order.status || 'pending_payment'}</span>
+                        <div className="track-title-block">
+                            <p className="eyebrow track-eyebrow">{order.orderNumber || 'Online Order'}</p>
+                            <h2 className="track-customer-name">{order.customerName || 'Guest'}</h2>
+                            <p className="track-token-line">Tracking token: <span>{order.trackingToken || token || '—'}</span></p>
+                        </div>
+                        <div className="track-actions-row">
                             <button className="secondary-btn" onClick={() => lookup(order.trackingToken || '')}>Refresh</button>
                             <button className="secondary-btn" onClick={() => { setHistoryOpen(true); }}>Order History</button>
                         </div>
                     </div>
-                    <div className="track-meta">
-                        <div><MapPin size={16} /> {order.deliveryType || 'pickup'}</div>
-                        <div><Wallet size={16} /> {order.paymentStatus || 'pending'}</div>
-                        <div><Clock3 size={16} /> {order.orderedAt ? new Date(order.orderedAt).toLocaleString() : 'Just now'}</div>
-                    </div>
-                    {/* Items */}
-                    <div className="track-items mt-4">
-                        <h3 className="text-sm text-gray-300">Items</h3>
-                        <div className="space-y-2 mt-2">
-                            {(order.items || []).map((it, idx) => (
-                                <div key={idx} className="flex justify-between bg-white/5 p-3 rounded-lg">
-                                    <div>
-                                        <div className="font-semibold">{it.menuItemName}</div>
-                                        <div className="text-sm text-gray-400">{it.sizeName} • Qty: {it.qty}</div>
-                                    </div>
-                                    <div className="text-green-300 font-semibold">Rs {Number(it.basePrice || 0) * (it.qty || 1)}</div>
-                                </div>
-                            ))}
+
+                    <div className="track-top-grid">
+                        <div className="track-info-card track-info-card-delivery track-info-card-body">
+                            <div className="track-info-label track-info-label-delivery">
+                                <MapPin size={14} /> Delivery Type
+                            </div>
+                            <p className="track-info-value">{order.deliveryType || 'pickup'}</p>
+                        </div>
+                        <div className="track-info-card track-info-card-payment track-info-card-body">
+                            <div className="track-info-label track-info-label-payment">
+                                <Wallet size={14} /> Payment
+                            </div>
+                            <p className="track-info-value">{order.paymentStatus || 'pending'}</p>
+                        </div>
+                        <div className="track-info-card track-info-card-time track-info-card-body">
+                            <div className="track-info-label track-info-label-time">
+                                <Clock3 size={14} /> Placed At
+                            </div>
+                            <p className="track-info-value">{order.orderedAt ? new Date(order.orderedAt).toLocaleString() : 'Just now'}</p>
                         </div>
                     </div>
 
-                    {/* Timeline */}
-                    <div className="track-timeline mt-6">
-                        <h3 className="text-sm text-gray-300">Timeline</h3>
-                        <ul className="mt-2 text-sm text-gray-400 space-y-2">
-                            <li><strong>Ordered:</strong> {order.orderedAt ? new Date(order.orderedAt).toLocaleString() : '—'}</li>
-                            <li><strong>Expected:</strong> {order.expectedDeliveryAt ? new Date(order.expectedDeliveryAt).toLocaleString() : '—'}</li>
-                            <li><strong>Delivered:</strong> {order.deliveredAt ? new Date(order.deliveredAt).toLocaleString() : '—'}</li>
-                            <li><strong>Payment Method:</strong> {order.paymentMethod || '—'}</li>
-                            <li><strong>Payment Status:</strong> {order.paymentStatus || '—'}</li>
-                        </ul>
+                    <div className="track-progress-panel">
+                        <div className="track-progress-head">
+                            <span className="font-semibold">Live progress</span>
+                            <span>{progressIndex + 1} of {statusFlow.length}</span>
+                        </div>
+                        <div className="track-progress-grid">
+                            {statusFlow.map((step, index) => {
+                                const active = index <= progressIndex
+                                const cls = `track-step ${active ? `track-step-active ${statusClassName(step)}` : 'track-step-inactive'}`
+                                return (
+                                    <div
+                                        key={step}
+                                        className={cls}
+                                    >
+                                        <div className="track-step-meter">
+                                            <div className={`track-step-meter-fill ${active ? 'track-step-meter-fill-active' : ''}`} />
+                                        </div>
+                                        {statusLabel[step] || step.replace(/_/g, ' ')}
+                                    </div>
+                                )
+                            })}
+                        </div>
                     </div>
-                    <div className="track-summary">
+
+                    <div className="track-mini-grid">
+                        <div className="track-mini-card track-mini-card-order">
+                            <p className="track-mini-label">Order</p>
+                            <p className="track-mini-value">{order.orderNumber || '—'}</p>
+                        </div>
+                        <div className="track-mini-card track-mini-card-payment">
+                            <p className="track-mini-label">Payment</p>
+                            <p className="track-mini-value">{order.paymentStatus || 'pending'}</p>
+                        </div>
+                        <div className="track-mini-card track-mini-card-total">
+                            <p className="track-mini-label">Total</p>
+                            <p className="track-mini-value">{money(order.total || 0)}</p>
+                        </div>
+                    </div>
+
+                    <div className="track-detail-grid">
+                        <div className="track-detail-card track-detail-card-items">
+                            <h3 className="track-detail-title track-detail-title-items">Items</h3>
+                            <div className="track-items-list">
+                                {(order.items || []).map((it, idx) => (
+                                    <div key={idx} className="track-item-row">
+                                        <div>
+                                            <div className="track-item-name">{it.menuItemName}</div>
+                                            <div className="track-item-meta">{it.sizeName} • Qty: {it.qty}</div>
+                                        </div>
+                                        <div className="track-item-price">
+                                            Rs {Number(it.basePrice || 0) * (it.qty || 1)}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="track-detail-card track-detail-card-timeline">
+                            <h3 className="track-detail-title track-detail-title-timeline">Tracking Details</h3>
+                            <ul className="track-timeline-list">
+                                <li><strong>Ordered:</strong> {order.orderedAt ? new Date(order.orderedAt).toLocaleString() : '—'}</li>
+                                <li><strong>Expected:</strong> {order.expectedDeliveryAt ? new Date(order.expectedDeliveryAt).toLocaleString() : '—'}</li>
+                                <li><strong>Delivered:</strong> {order.deliveredAt ? new Date(order.deliveredAt).toLocaleString() : '—'}</li>
+                                <li><strong>Payment Method:</strong> {order.paymentMethod || '—'}</li>
+                                <li><strong>Payment Status:</strong> {order.paymentStatus || '—'}</li>
+                            </ul>
+                        </div>
+                    </div>
+
+                    <div className="track-summary track-total-bar">
                         <strong>Total</strong>
                         <span>{money(order.total || 0)}</span>
                     </div>
@@ -692,9 +1063,13 @@ function TrackPage() {
 function AppRouter() {
     return (
         <Routes>
-            <Route path="/" element={<HomePage />} />
+            <Route path="/login" element={hasOnlineOrderAccess() ? <Navigate to="/home" replace /> : <LoginPage />} />
+            <Route path="/register" element={hasOnlineOrderAccess() ? <Navigate to="/home" replace /> : <RegisterPage />} />
+            <Route path="/" element={<Navigate to={hasOnlineOrderAccess() ? '/home' : '/login'} replace />} />
+            <Route path="/home" element={<OnlineOrderGuard><HomePage /></OnlineOrderGuard>} />
             <Route path="/track" element={<TrackPage />} />
             <Route path="/track/:token" element={<TrackPage />} />
+            <Route path="/menu/:id" element={<OnlineOrderGuard><HomePage /></OnlineOrderGuard>} />
             <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
     )

@@ -1,5 +1,6 @@
 {
     "compilerOptions": {
+        "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
         "target": "ES2022",
         "useDefineForClassFields": true,
         "lib": [
@@ -8,13 +9,19 @@
             "DOM.Iterable"
         ],
         "allowJs": false,
+        "types": [
+            "vite/client"
+        ],
         "skipLibCheck": true,
         "esModuleInterop": true,
         "allowSyntheticDefaultImports": true,
         "strict": true,
         "forceConsistentCasingInFileNames": true,
         "module": "ESNext",
-        "moduleResolution": "Node",
+        "moduleResolution": "bundler",
+        "allowImportingTsExtensions": true,
+        "verbatimModuleSyntax": true,
+        "moduleDetection": "force",
         "resolveJsonModule": true,
         "isolatedModules": true,
         "noEmit": true,
